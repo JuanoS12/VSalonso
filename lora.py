@@ -1,138 +1,132 @@
-import network
 import time
 import ujson
-from machine import Pin, ADC, I2C, PWM
+from machine import ADC, Pin, UART
 from umqtt.simple import MQTTClient
 from tflite_runtime.interpreter import Interpreter
-import ubinascii
-
-# Wi-Fi Configuration
-SSID = 'INFINITUME18B_plus'
-PASSWORD = 'cNHkP4gFjT'
+import math
 
 # MQTT Configuration
 MQTT_SERVER = 'broker.emqx.io'
 MQTT_PORT = 1883
 MQTT_CLIENT_ID = 'ESP32_TrashCan'
-TOPIC_ALERT = 'TrashCan/Alert'
-TOPIC_DATA = 'TrashCan/Data'
+TOPIC_PREDICTION = 'TrashCan/Prediction'
 USERNAME = 'jair'
 PASSWORD_MQTT = 'ola'
 
-# Sensor Pins
-level_sensor = ADC(Pin(32))  # Replace with your ultrasonic sensor pin
-weight_sensor = ADC(Pin(33))
-odor_sensor = ADC(Pin(34))
-
-# Actuator Pin (Compressor)
-compressor = Pin(27, Pin.OUT)
+# Pins Configuration
+level_sensor = ADC(Pin(32))  # Fill level sensor
+weight_sensor = ADC(Pin(33))  # Weight sensor
+odor_sensor = ADC(Pin(34))  # Odor sensor
+gps_uart = UART(1, baudrate=9600, tx=17, rx=16)  # GPS module (pins may vary)
 
 # ML Model Path
-MODEL_PATH = 'autoencoder_model.tflite'
+MODEL_PATH = 'fill_level_model.tflite'
 
-# Initialize LoRa (Placeholder for actual LoRa configuration)
-# Add LoRa setup code here.
-
-# Connect to Wi-Fi
-def connect_wifi():
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
-    wlan.connect(SSID, PASSWORD)
-    while not wlan.isconnected():
-        print("Connecting to Wi-Fi...")
-        time.sleep(1)
-    print("Connected to Wi-Fi:", wlan.ifconfig())
-
-# MQTT Setup
+# Initialize MQTT Client
 def connect_mqtt():
     client = MQTTClient(MQTT_CLIENT_ID, MQTT_SERVER, port=MQTT_PORT, user=USERNAME, password=PASSWORD_MQTT)
     client.connect()
     print("Connected to MQTT Broker")
     return client
 
-# Initialize TensorFlow Lite Model
+# Load TensorFlow Lite Model
 def load_model():
     interpreter = Interpreter(model_path=MODEL_PATH)
     interpreter.allocate_tensors()
     return interpreter
 
-# Run ML Inference
-def detect_anomaly(interpreter, level, weight, odor):
-    # Prepare input data (normalize if necessary)
-    sensor_data = [level / 4095, weight / 4095, odor / 4095]  # Scale ADC values to 0-1
-    sensor_data = [sensor_data]
+# Read GPS Data
+def read_gps():
+    if gps_uart.any():
+        gps_data = gps_uart.readline().decode('utf-8').strip()
+        # Example NMEA Sentence Parsing for Latitude/Longitude
+        if gps_data.startswith('$GPGGA'):
+            parts = gps_data.split(',')
+            if len(parts) > 5:
+                lat = float(parts[2]) / 100.0
+                lon = float(parts[4]) / 100.0
+                return {"latitude": lat, "longitude": lon}
+    return {"latitude": None, "longitude": None}
 
-    # Set input tensor
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-    interpreter.set_tensor(input_details[0]['index'], sensor_data)
-
-    # Run inference
-    interpreter.invoke()
-
-    # Get output and compute reconstruction error
-    reconstructed_data = interpreter.get_tensor(output_details[0]['index'])
-    reconstruction_error = sum((a - b)**2 for a, b in zip(sensor_data[0], reconstructed_data[0]))
-
-    # Threshold for anomaly detection
-    if reconstruction_error > 0.05:  # Adjust based on your model
-        return True
-    return False
-
-# Read Sensor Data
+# Read Sensor Data with Filtering
 def read_sensors():
-    level = level_sensor.read()
-    weight = weight_sensor.read()
-    odor = odor_sensor.read()
+    # Filter ADC readings with a simple moving average
+    def filter_adc(pin, samples=10):
+        values = [pin.read() for _ in range(samples)]
+        return sum(values) / len(values)
+
+    level = filter_adc(level_sensor)
+    weight = filter_adc(weight_sensor)
+    odor = filter_adc(odor_sensor)
+
+    # Normalize sensor data (scale to 0-1)
+    level = level / 4095
+    weight = weight / 4095
+    odor = odor / 4095
+
     return level, weight, odor
 
-# Compressor Control
-def compress_waste():
-    print("Compressing Waste...")
-    compressor.value(1)
-    time.sleep(2)  # Adjust compression time
-    compressor.value(0)
+# Predict Time to Collect Using ML Model
+def predict_time_to_collect(interpreter, level, rate_of_fill):
+    # Prepare input
+    input_data = [[level, rate_of_fill]]
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
 
-# Send Alerts via LoRa or MQTT
-def send_alert(client, message):
-    print("Sending Alert:", message)
-    client.publish(TOPIC_ALERT, ujson.dumps(message))
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+
+    # Get prediction
+    predicted_time = interpreter.get_tensor(output_details[0]['index'])
+    return predicted_time[0]
 
 # Main Function
 def main():
-    connect_wifi()
-    client = connect_mqtt()
+    mqtt_client = connect_mqtt()
     interpreter = load_model()
 
+    print("Starting monitoring...")
+    previous_level = None
     while True:
         try:
-            # Read sensors
+            # Read sensor data
             level, weight, odor = read_sensors()
-            print(f"Level: {level}, Weight: {weight}, Odor: {odor}")
+            gps_data = read_gps()
 
-            # Run anomaly detection
-            is_anomaly = detect_anomaly(interpreter, level, weight, odor)
-
-            if is_anomaly:
-                print("Anomaly Detected!")
-                send_alert(client, {"event": "anomaly", "level": level, "weight": weight, "odor": odor})
+            # Calculate rate of fill (delta level / time)
+            if previous_level is None:
+                previous_level = level
+                rate_of_fill = 0
             else:
-                print("Normal Operation")
+                rate_of_fill = abs(level - previous_level) / 10  # Assuming 10 seconds between measurements
+                previous_level = level
 
-            # Actuator Logic
-            if level > 3000:  # Example threshold for fullness
-                compress_waste()
+            print(f"Level: {level:.2f}, Rate of Fill: {rate_of_fill:.4f}, Weight: {weight:.2f}, Odor: {odor:.2f}")
+            print(f"GPS: {gps_data}")
 
-            # Send periodic data update
-            data_payload = {"level": level, "weight": weight, "odor": odor, "status": "normal" if not is_anomaly else "anomaly"}
-            client.publish(TOPIC_DATA, ujson.dumps(data_payload))
+            # Predict time to collect
+            predicted_time = predict_time_to_collect(interpreter, level, rate_of_fill)
+            print(f"Predicted Time to Collect: {predicted_time:.2f} hours")
 
-            time.sleep(10)  # Adjust frequency
+            # Publish prediction data
+            payload = {
+                "level": level,
+                "rate_of_fill": rate_of_fill,
+                "weight": weight,
+                "odor": odor,
+                "predicted_time": predicted_time,
+                "gps": gps_data
+            }
+            mqtt_client.publish(TOPIC_PREDICTION, ujson.dumps(payload))
+            print("Data published to MQTT.")
+
+            # Wait before next reading
+            time.sleep(10)
 
         except Exception as e:
-            print("Error:", str(e))
+            print("Error:", e)
             time.sleep(5)
 
-# Run the main function
+# Run the main loop
 if __name__ == "__main__":
     main()
