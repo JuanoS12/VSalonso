@@ -1,3 +1,6 @@
+# Main file for developing a smart trash can using sensor and Machine Learning
+# Train ML model before using
+
 import time
 import ujson
 from machine import ADC, Pin, UART
